@@ -59,6 +59,28 @@ void Driver::init() {
 
     if (dev_desc.bLength != 18 || dev_desc.bcdUSB  != 0x200 /*USB 2.0.0*/)
         throw std::runtime_error("Bad data from USB dev");
+
+    USBIO::Transfer t_for_string;
+    t_for_string.buffer = new unsigned char[255]; // I think 255 is max str len
+    t_for_string.usb_fb = fd;
+    t_for_string.data_len = 255;
+    t_for_string.endpoint = 0;
+    t_for_string.type = USBIO::TransferType::CONTROL;
+
+    USBIO::buffForStringDesc(t_for_string.buffer);
+    const int r = USBIO::transfer(&t_for_string);
+    if (r < 0)
+        throw std::runtime_error("error wiht ctl transfer");
+
+    auto* depth_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
+    // DepthConnection.nUSBBufferReadOffset = 0;
+    // DepthConnection.nUSBBufferWriteOffset = 0;
+
+    auto* image_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
+    // ImageConnection.nUSBBufferReadOffset = 0;
+    // ImageConnection.nUSBBufferWriteOffset = 0;
+
+    // looks like some cams support "misc" data, doubt mine does, but check later
 }
 
 }
