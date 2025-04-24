@@ -1,70 +1,55 @@
 #include "usb_io/usb_io.h"
 
-#include <stdexcept>
 #include <cstdint>
 
 #include <sys/ioctl.h>
 #include <linux/usbdevice_fs.h>
 #include <linux/usb/ch9.h>
 #include <sys/errno.h>
+#include <cstring>
 
 namespace USBIO {
 namespace {
-struct __attribute__((packed)) ControlRequest {
-    // 0:4 for recipient
-    // 5:6 for type
-    // 7 for direction (see usb 2.0 docs)
-    std::uint8_t bmRequestType;
-    std::uint8_t  bRequest;
-    std::uint16_t wValue;
-    std::uint16_t wIndex;
-    std::uint16_t wLength;
-};
-
-static_assert(sizeof(ControlRequest) == 8);
-
 // find real number
 constexpr int MAX_CONTROL_TRANSFER_DATA_PAYLOAD = 4096;
-int control_transfer(Transfer* const transfer) {
-	if (transfer->data_len - sizeof(ControlRequest) > MAX_CONTROL_TRANSFER_DATA_PAYLOAD)
-		return -1; // or throw too big or smth... maybe write an error type?
+TransferError control_transfer(Transfer* const transfer) {
+	if (transfer->data_len - sizeof(usbdevfs_ctrltransfer) > MAX_CONTROL_TRANSFER_DATA_PAYLOAD)
+		return TransferError::ERROR;
     
-    usbdevfs_urb* const urb = (usbdevfs_urb*) calloc(1, sizeof(usbdevfs_urb));
-	urb->usercontext = transfer;
-	urb->type = USBDEVFS_URB_TYPE_CONTROL;
-	urb->endpoint = transfer->endpoint;
-	urb->buffer = transfer->buffer;
-	urb->buffer_length = transfer->data_len;
+    // usbdevfs_urb* const urb = new usbdevfs_urb{};
+	// urb->usercontext = transfer;
+	// urb->type = USBDEVFS_URB_TYPE_CONTROL;
+	// urb->endpoint = transfer->endpoint;
+	// urb->buffer = transfer->buffer;
+	// urb->buffer_length = transfer->data_len;
 
-    const int r = ioctl(transfer->usb_fb, USBDEVFS_SUBMITURB, urb);
+    const int r = ioctl(transfer->usb_fb, USBDEVFS_CONTROL, transfer->buffer);
     if (r < 0) {
-        free(urb);
 
         if (errno == ENODEV)
-            return -1;
+            return TransferError::ERROR;
 
-        throw std::runtime_error("submiturb failed, errno=" + errno);
+        return TransferError::ERROR;
     }
 
-    free(urb); // DELETEME will need to hold onto urb for results
-    return 0;
+    return TransferError::SUCCESS;
 }
 
 // TODO
-int bulk_transfer(const Transfer* const transfer) {
-    return -1;
+TransferError bulk_transfer(const Transfer* const transfer) {
+    return TransferError::ERROR;
 }
 
 // TODO
-int iso_transfer(const Transfer* const transfer) {
-    return -1;
+TransferError iso_transfer(const Transfer* const transfer) {
+    return TransferError::ERROR;
 }
 
 }
 
-int transfer(Transfer* const transfer) {
+TransferError transfer(Transfer* const transfer) {
     if (!transfer)
-        return -1;
+        return TransferError::ERROR;
 
     switch (transfer->type) {
         case TransferType::CONTROL:
@@ -76,21 +61,22 @@ int transfer(Transfer* const transfer) {
             return bulk_transfer(transfer);
         case TransferType::ISOCHRONOUS:
             return iso_transfer(transfer);
-        default:
-            throw std::runtime_error("unknown transfer type" + static_cast<int>(transfer->type));
     }
 
-    return -1;
+    return TransferError::ERROR;
 }
 
-void buffForStringDesc(void* const buffer) {
-    auto* ctrl = (ControlRequest*) buffer;
+void transferForUSBManufacturer(Transfer* const tranfer, const char* str_buff, const int str_buff_len) {
+    auto* ctrl = (usbdevfs_ctrltransfer*) tranfer->buffer;
+    std::memset(ctrl, 0, sizeof(usbdevfs_ctrltransfer));
+    tranfer->data_len = sizeof(usbdevfs_ctrltransfer);
 
-    ctrl->bmRequestType = USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE;
+    ctrl->bRequestType = USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE;
     ctrl->bRequest = USB_REQ_GET_DESCRIPTOR;
     ctrl->wValue = (USB_DT_STRING << 8) | 1;  // index 1 (manufacturer)
     ctrl->wIndex = 0;
-    ctrl->wLength = 255;
+    ctrl->wLength = str_buff_len;
+    ctrl->data = (void*) str_buff;
 }
 
 }

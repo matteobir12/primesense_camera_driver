@@ -61,17 +61,30 @@ void Driver::init() {
         throw std::runtime_error("Bad data from USB dev");
 
     USBIO::Transfer t_for_string;
-    t_for_string.buffer = new unsigned char[255]; // I think 255 is max str len
+    t_for_string.buffer = new unsigned char[64]{};
     t_for_string.usb_fb = fd;
-    t_for_string.data_len = 255;
+    t_for_string.data_len = 64;
     t_for_string.endpoint = 0;
     t_for_string.type = USBIO::TransferType::CONTROL;
 
-    USBIO::buffForStringDesc(t_for_string.buffer);
-    const int r = USBIO::transfer(&t_for_string);
-    if (r < 0)
-        throw std::runtime_error("error wiht ctl transfer");
+    char s_buffer[256];
+    memset(s_buffer, 'a', 255);
+    s_buffer[255] = '\0';
+    USBIO::transferForUSBManufacturer(&t_for_string, s_buffer, 255);
+    const auto r = USBIO::transfer(&t_for_string);
+    if (r != USBIO::TransferError::SUCCESS)
+        std::cout << "ERROR\n";
 
+    delete[] t_for_string.buffer;
+
+    // returned buffer is (char) data len, (char) desc (doesn't matter), (UCS-2) data
+    for (int i = 0; i < sizeof(s_buffer); ++i) {
+        printf("%02x ", (unsigned char) s_buffer[i]);
+        if ((i + 1) % 16 == 0) {
+            printf("\n");
+        }
+    }
+    printf("\n");
     auto* depth_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
     // DepthConnection.nUSBBufferReadOffset = 0;
     // DepthConnection.nUSBBufferWriteOffset = 0;

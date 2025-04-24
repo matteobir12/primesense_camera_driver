@@ -9,6 +9,11 @@ enum class TransferType  {
     ISOCHRONOUS
 };
 
+enum class TransferError {
+    SUCCESS,
+    ERROR
+};
+
 struct Transfer {
     TransferType type;
     // maybe a private lib thing
@@ -22,8 +27,9 @@ struct Transfer {
     // callback?
 };
 
-int transfer(Transfer* const transfer);
+TransferError transfer(Transfer* const transfer);
 
-void buffForStringDesc(void* const buffer);
+void transferForUSBManufacturer(Transfer* const tranfer, const char* str_buff, const int str_buff_len);
+
 
 }
