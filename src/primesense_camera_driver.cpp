@@ -4,46 +4,50 @@
 #include <iostream>
 
 #include <stdexcept>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
 #include <cstdint>
-
-#include <linux/ioctl.h>
+#include <glob.h>
+#include <utility>
+#include <array>
+#include <algorithm>
 
 namespace PS1080 {
 namespace {
-
-// following naming convention from USB 2.0 doc
-struct __attribute__((packed)) UsbDiscriptor {
-    std::uint8_t bLength;
-    std::uint8_t bDescriptorType;
-    std::uint16_t bcdUSB;
-    std::uint8_t bDeviceClass;
-    std::uint8_t bDeviceSubClass;
-    std::uint8_t bDeviceProtocol;
-    std::uint8_t bMaxPacketSize0;
-    std::uint16_t idVender;
-    std::uint16_t idProduct;
-    std::uint16_t bcdDevice;
-    std::uint8_t iManufacturer;
-    std::uint8_t iProduct;
-    std::uint8_t iSerialNumber;
-    std::uint8_t bNumConfigurations;
+constexpr std::array<std::pair<std::uint16_t, std::uint16_t>, 1> SUPPORTED_DEVS = {
+    std::pair<std::uint16_t, std::uint16_t>{ 0x1d27 /* idVender */, 0x0609 /* idProduct */},
 };
 
-static_assert(sizeof(UsbDiscriptor) == 18);
+constexpr const char* USB_PATH = "/dev/bus/usb/**/*";
 
 }
 
 Driver::Driver() {
-    //TODO
+    glob_t usb_devs_glob;
+    glob(USB_PATH, 0, NULL, &usb_devs_glob);
+
+    for (int dev_idx = 0; dev_idx < usb_devs_glob.gl_pathc; dev_idx++) {
+        char* const usb_dev_path = usb_devs_glob.gl_pathv[dev_idx];
+        const auto dec = USBIO::probeUSBDescriptor(usb_dev_path);
+        if (dec) {
+            const auto found_dev_it = std::find_if(
+                    SUPPORTED_DEVS.begin(),
+                    SUPPORTED_DEVS.end(),
+                    [&dec](const auto& dev_ids) { 
+                        return dev_ids.first == dec->idVender && dev_ids.second == dec->idProduct; });
+
+            if (found_dev_it != SUPPORTED_DEVS.end()) {
+                fd = USBIO::openUSBDEV(usb_dev_path);
+                break;
+            }
+        }
+    }
+
+    globfree(&usb_devs_glob);
+
     init();
 }
 
 Driver::Driver(const char* const handle) {
-    fd = open(handle, O_RDWR);
+    fd = USBIO::openUSBDEV(handle);
     init();
 }
 
@@ -51,49 +55,48 @@ void Driver::init() {
     if (fd < 0)
         throw std::runtime_error("Couldn't open USB dev");
     
-    UsbDiscriptor dev_desc;
-    const auto read_size = read(fd, &dev_desc, sizeof(UsbDiscriptor));
-    
-    if (read_size != 18)
-        throw std::runtime_error("Unexpected discriptor size");
-
-    if (dev_desc.bLength != 18 || dev_desc.bcdUSB  != 0x200 /*USB 2.0.0*/)
+    auto dev_desc = USBIO::probeUSBDescriptor(fd);
+    if (!dev_desc || dev_desc->bcdUSB != 0x200 /*USB 2.0.0*/)
         throw std::runtime_error("Bad data from USB dev");
 
-    USBIO::Transfer t_for_string;
-    t_for_string.buffer = new unsigned char[64]{};
-    t_for_string.usb_fb = fd;
-    t_for_string.data_len = 64;
-    t_for_string.endpoint = 0;
-    t_for_string.type = USBIO::TransferType::CONTROL;
-
-    char s_buffer[256];
-    memset(s_buffer, 'a', 255);
-    s_buffer[255] = '\0';
-    USBIO::transferForUSBManufacturer(&t_for_string, s_buffer, 255);
-    const auto r = USBIO::transfer(&t_for_string);
-    if (r != USBIO::TransferError::SUCCESS)
-        std::cout << "ERROR\n";
-
-    delete[] t_for_string.buffer;
-
-    // returned buffer is (char) data len, (char) desc (doesn't matter), (UCS-2) data
-    for (int i = 0; i < sizeof(s_buffer); ++i) {
-        printf("%02x ", (unsigned char) s_buffer[i]);
-        if ((i + 1) % 16 == 0) {
-            printf("\n");
-        }
-    }
-    printf("\n");
     auto* depth_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
     // DepthConnection.nUSBBufferReadOffset = 0;
     // DepthConnection.nUSBBufferWriteOffset = 0;
+
+    std::cout << fetchStringFromST(1) << std::endl;
 
     auto* image_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
     // ImageConnection.nUSBBufferReadOffset = 0;
     // ImageConnection.nUSBBufferWriteOffset = 0;
 
     // looks like some cams support "misc" data, doubt mine does, but check later
+}
+
+std::string Driver::fetchStringFromST(const int indx) {
+    unsigned char req_buff[64]{};
+    USBIO::Transfer t_for_string;
+    t_for_string.buffer = req_buff;
+    t_for_string.usb_fd = fd;
+    t_for_string.data_len = 64;
+    t_for_string.endpoint = 0;
+    t_for_string.type = USBIO::TransferType::CONTROL;
+
+    std::cout << fd;
+    char s_buffer[255];
+    USBIO::transferForUSBString(&t_for_string, indx, s_buffer, 255);
+    const auto r = USBIO::transfer(&t_for_string);
+    if (r != USBIO::TransferError::SUCCESS)
+        return "ERROR";
+
+    // returned buffer is (char) data len, (char) desc (doesn't matter), (UCS-2) data
+    const std::uint8_t data_len = s_buffer[0] - 2;
+
+    // simple USC-2 to ASCII
+    char asciiStr[data_len];
+    for (std::uint8_t i = 0; i < data_len; i++)
+        asciiStr[i] = s_buffer[(i * 2) + 2];
+
+    return std::string(asciiStr);
 }
 
 }

@@ -1,7 +1,9 @@
 // PS1080 Userspace USB Driver
 #pragma once
 
-#include "usb_io/usb_io.h"
+#include "usb_io/u_usbfs_io.h"
+
+#include <string>
 
 // From OpenNI2, 4 chan 1024 x 1024 px
 #define SENSOR_PROTOCOL_USB_BUFFER_SIZE 4 * 1024 * 1024
@@ -16,6 +18,7 @@ class Driver {
     // Needs to be null terminated
     Driver(const char* const handle);
 
+    std::string fetchStringFromST(const int indx);
   private:
     void init();
 
