@@ -22,11 +22,11 @@ constexpr const char* USB_PATH = "/dev/bus/usb/**/*";
 
 Driver::Driver() {
     glob_t usb_devs_glob;
-    glob(USB_PATH, 0, NULL, &usb_devs_glob);
+    glob(USB_PATH, 0, nullptr, &usb_devs_glob);
 
     for (int dev_idx = 0; dev_idx < usb_devs_glob.gl_pathc; dev_idx++) {
         char* const usb_dev_path = usb_devs_glob.gl_pathv[dev_idx];
-        const auto dec = USBIO::probeUSBDescriptor(usb_dev_path);
+        const auto dec = USBIO::probeUSBDeviceDescriptor(usb_dev_path);
         if (dec) {
             const auto found_dev_it = std::find_if(
                     SUPPORTED_DEVS.begin(),
@@ -55,8 +55,10 @@ void Driver::init() {
     if (fd < 0)
         throw std::runtime_error("Couldn't open USB dev");
     
-    auto dev_desc = USBIO::probeUSBDescriptor(fd);
-    if (!dev_desc || dev_desc->bcdUSB != 0x200 /*USB 2.0.0*/)
+    auto dev_desc = USBIO::probeUSBDeviceDescriptor(fd);
+    if (!dev_desc ||
+        dev_desc->bcdUSB != 0x200 /*USB 2.0.0*/ ||
+        dev_desc->bNumConfigurations != 1 /* Expect 1 config */)
         throw std::runtime_error("Bad data from USB dev");
 
     auto* depth_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
@@ -64,6 +66,8 @@ void Driver::init() {
     // DepthConnection.nUSBBufferWriteOffset = 0;
 
     std::cout << fetchStringFromST(1) << std::endl;
+
+    fetchConnectionInterfaces();
 
     auto* image_conn_usb_buffer = new char[SENSOR_PROTOCOL_USB_BUFFER_SIZE];
     // ImageConnection.nUSBBufferReadOffset = 0;
@@ -73,17 +77,13 @@ void Driver::init() {
 }
 
 std::string Driver::fetchStringFromST(const int indx) {
-    unsigned char req_buff[64]{};
     USBIO::Transfer t_for_string;
-    t_for_string.buffer = req_buff;
     t_for_string.usb_fd = fd;
-    t_for_string.data_len = 64;
     t_for_string.endpoint = 0;
     t_for_string.type = USBIO::TransferType::CONTROL;
 
-    std::cout << fd;
     char s_buffer[255];
-    USBIO::transferForUSBString(&t_for_string, indx, s_buffer, 255);
+    USBIO::transferForUSBString(&t_for_string, indx, s_buffer, sizeof(s_buffer));
     const auto r = USBIO::transfer(&t_for_string);
     if (r != USBIO::TransferError::SUCCESS)
         return "ERROR";
@@ -92,11 +92,30 @@ std::string Driver::fetchStringFromST(const int indx) {
     const std::uint8_t data_len = s_buffer[0] - 2;
 
     // simple USC-2 to ASCII
-    char asciiStr[data_len];
+    char ascii_str[data_len];
     for (std::uint8_t i = 0; i < data_len; i++)
-        asciiStr[i] = s_buffer[(i * 2) + 2];
+    ascii_str[i] = s_buffer[(i * 2) + 2];
 
-    return std::string(asciiStr);
+    return std::string(ascii_str);
+}
+
+// Assumes num usb configs is 1 (which is true for our device)
+void Driver::fetchConnectionInterfaces() {
+    USBIO::Transfer t_for_string;
+    t_for_string.usb_fd = fd;
+    t_for_string.endpoint = 0;
+    t_for_string.type = USBIO::TransferType::CONTROL;
+    auto dt = USBIO::getUSBDescriptorTree(fd);
+
+    if (!dt || dt->configs.size() != 1)
+        throw std::runtime_error("Unexpected when fetching desc tree");
+
+    const auto& cfg = dt->configs[0];
+    for (auto& iface : cfg.interfaces) {
+        for (auto& ep : iface.endpoints) {
+            std::printf("%d\n", ep.transfer_type);
+        }
+    }
 }
 
 }
