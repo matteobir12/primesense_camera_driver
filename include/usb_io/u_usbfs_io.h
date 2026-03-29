@@ -1,7 +1,11 @@
 #pragma once
 
-#include <optional>
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <thread>
 #include <vector>
 
 // following naming convention from USB 2.0 doc
@@ -71,14 +75,14 @@ enum class SyncType  {
     ADAPTIVE,
     ASYNC,
     SYNC
-};  
+};
 
 enum class UsageType  {
     DATA_ENDPOINT,
     IMPLICIT_FEEDBACK_DATA_ENDPOINT, // ??
     FEEDBACK_ENDPOINT,
     RESERVED // ??
-};  
+};
 
 struct EndpointDescriptor {
     uint8_t bEndpointAddress;
@@ -128,9 +132,10 @@ struct Transfer {
     TransferType type;
     // maybe a private lib thing
     int usb_fd = -1;
-    unsigned char endpoint;
 
     // Opaque, set with 'transferFor' lib funcs
+    // This is a stupid abstraction and a stupid struct. If I actually care about
+    // this USBLIB should take a different approach, likely around the UsbDescriptorTree
     TransferData d;
 };
 
@@ -146,7 +151,34 @@ void closeUSBDEV(const int fd);
 TransferError transfer(Transfer* const transfer);
 
 void transferForUSBString(Transfer* const transfer, const int index, const char* str_buff, const int str_buff_len);
-void transferForConfigDescriptor(Transfer* const transfer, const char* buff, const int buff_len = sizeof(UsbConfigDiscriptor));
+void transferForConfigDescriptor(Transfer* const transfer, const unsigned char* buff, const int buff_len = sizeof(UsbConfigDiscriptor));
 void transferForBulk(Transfer* const transfer, const unsigned int ep, void* const buff, const int buff_len, const unsigned int timeout = 100);
+// void transferForIsochronous(Transfer* const transfer, const EndpointDescriptor& ep, void* const buff, const int buff_len);
+
+struct IsochronousConfig {
+    EndpointDescriptor ep;
+    int packets_per_urb;
+    int ring_size; // how many URBs to keep in flight
+    std::function<void(const uint8_t* data, size_t len)> on_packet;
+};
+class InterfaceForIso {
+  public:
+    InterfaceForIso() = default;
+    InterfaceForIso(const int fd, const InterfaceDescriptor& interface);
+    ~InterfaceForIso();
+    InterfaceForIso(const InterfaceForIso&) = delete;
+    InterfaceForIso& operator=(const InterfaceForIso&) = delete;
+    InterfaceForIso(InterfaceForIso&&) = default;
+    InterfaceForIso& operator=(InterfaceForIso&&) = default;
+
+    TransferError startIsochronousCapture(const IsochronousConfig& cfg);
+    TransferError stopIsochronousCapture(uint8_t ep_address);
+
+  private:
+    const int fd_ = -1;
+    InterfaceDescriptor interface_;
+    std::unordered_map<uint8_t, std::pair<std::thread, std::unique_ptr<std::atomic_bool>>>
+        ep_addr_to_thread_and_keep_alive_flag_;
+};
 
 }

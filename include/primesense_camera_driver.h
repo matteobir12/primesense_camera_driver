@@ -21,7 +21,6 @@ class Driver {
     std::string fetchStringFromST(const int indx);
   private:
     void init();
-    void fetchConnectionInterfaces();
 
     int fd = -1; // fd of USB dev or -1 if not init
 };

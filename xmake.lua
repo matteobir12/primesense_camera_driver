@@ -24,4 +24,3 @@ target("PS1080UDriver")
     add_files(os.files("src/**.cpp"))
     add_includedirs("include")
     add_cxxflags("-O3")
-    
