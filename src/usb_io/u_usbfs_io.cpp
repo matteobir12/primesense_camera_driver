@@ -133,7 +133,7 @@ void transferForConfigDescriptor(Transfer* const transfer, unsigned char* const 
 
     ctrl->bRequestType = USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE;
     ctrl->bRequest = USB_REQ_GET_DESCRIPTOR;
-    ctrl->wValue = (USB_DT_CONFIG << 8) | 0;  // index 1 (manufacturer)
+    ctrl->wValue = (USB_DT_CONFIG << 8) | 0;  // config descriptor, index 0
     ctrl->wIndex = 0;
     ctrl->wLength = buff_len;
     ctrl->data = (void*) buff;
@@ -180,7 +180,6 @@ std::optional<UsbDescriptorTree> getUSBDescriptorTree(const int fd) {
     // fixed size is dumb, but my camera as a total len of 206
     unsigned char buff[512];
     std::memset(buff, 0, sizeof(buff));
-    UsbConfigDiscriptor* d = (UsbConfigDiscriptor*) buff;
     transferForConfigDescriptor(&t, buff, 512);
     auto er = transfer(&t);
 
@@ -234,7 +233,7 @@ std::optional<UsbDescriptorTree> getUSBDescriptorTree(const int fd) {
                 ep.transfer_type = static_cast<TransferType>(buff[i + 3] & 0b00000011);
                 ep.sync_type = static_cast<SyncType>(buff[i + 3] & 0b00001100);
                 ep.usage_type = static_cast<UsageType>(buff[i + 3] & 0b00110000);
-                ep.wMaxPacketSize = buff[i + 4] | (buff[i + 5] << 8); // double check
+                ep.wMaxPacketSize = static_cast<uint16_t>(buff[i + 4]) | (buff[i + 5] << 8);
                 ep.bInterval = buff[i + 6];
                 current_iface->endpoints.push_back(ep);
                 break;
@@ -266,8 +265,13 @@ std::optional<UsbDescriptorTree> getUSBDescriptorTree(const int fd) {
 }
 
 namespace {
-void IsoWorker(const int fd, const std::atomic_bool& keep_alive, const IsochronousConfig& cfg) {
-    const std::size_t packet_data_size =  cfg.ep.wMaxPacketSize * cfg.packets_per_urb;
+void IsoWorker(const int fd, const std::atomic_bool& keep_alive, IsochronousConfig cfg) {
+    const uint16_t raw = cfg.ep.wMaxPacketSize;
+    const uint16_t mps = raw & 0x07FF;
+    const uint16_t mult  = ((raw >> 11) & 0x3) + 1; // high order is multiplier
+    const uint16_t packet_size = mps * mult;
+
+    const std::size_t packet_data_size =  packet_size * cfg.packets_per_urb;
     const std::size_t usbdevfs_urb_total_size =
         (sizeof(usbdevfs_iso_packet_desc) * cfg.packets_per_urb) + sizeof(usbdevfs_urb);
     const std::size_t buffer_ptr_array_size = sizeof(usbdevfs_urb*) * cfg.ring_size;
@@ -294,7 +298,7 @@ void IsoWorker(const int fd, const std::atomic_bool& keep_alive, const Isochrono
         init_buffs += 1;
 
         for (int p = 0; p < cfg.packets_per_urb; ++p) {
-            buffer_ptr_array[i]->iso_frame_desc[p].length = cfg.ep.wMaxPacketSize;
+            buffer_ptr_array[i]->iso_frame_desc[p].length = packet_size;
             buffer_ptr_array[i]->iso_frame_desc[p].actual_length = 0;
             buffer_ptr_array[i]->iso_frame_desc[p].status = 0;
         }
@@ -303,7 +307,7 @@ void IsoWorker(const int fd, const std::atomic_bool& keep_alive, const Isochrono
 
         r = ioctl(fd, USBDEVFS_SUBMITURB, buffer_ptr_array[i]);
         if (r < 0) {
-            std::cout << strerror(errno) << std::endl;
+            std::cout << errno << std::endl;
             break;  // ERROR
         }
     }
@@ -358,8 +362,25 @@ InterfaceForIso::InterfaceForIso(const int fd, const InterfaceDescriptor& interf
 
     int sr = ioctl(fd_, USBDEVFS_SETINTERFACE, &setintf);
     if (sr < 0)
-      fprintf(stderr, "SETINTERFACE iface=%d alt=%d errno=%s\n",
-          interface_num, interface_.bAlternateSetting, sr, strerror(errno));
+      std::cout << "err SETINTERFACE iface=" << interface_num << "alt=" <<
+            interface_.bAlternateSetting << "errno=" << strerror(errno) << std::endl;
+}
+
+InterfaceForIso::InterfaceForIso(InterfaceForIso&& other) noexcept
+    : fd_(other.fd_), interface_(std::move(other.interface_)),
+      ep_addr_to_thread_and_keep_alive_flag_(
+          std::move(other.ep_addr_to_thread_and_keep_alive_flag_))
+{ other.fd_ = -1; }
+
+InterfaceForIso& InterfaceForIso::operator=(InterfaceForIso&& other) noexcept {
+    if (this != &other) {
+        fd_ = other.fd_;
+        interface_ = std::move(other.interface_);
+        ep_addr_to_thread_and_keep_alive_flag_ =
+            std::move(other.ep_addr_to_thread_and_keep_alive_flag_);
+        other.fd_ = -1;
+    }
+    return *this;
 }
 
 InterfaceForIso::~InterfaceForIso()
@@ -387,7 +408,7 @@ TransferError InterfaceForIso::startIsochronousCapture(const IsochronousConfig& 
 
     const std::atomic_bool& keep_alive = *pair_it.first->second.second;
     pair_it.first->second.first =
-        std::thread(IsoWorker, fd_, std::cref(keep_alive), std::cref(cfg));
+        std::thread(IsoWorker, fd_, std::cref(keep_alive), cfg);
     return TransferError::SUCCESS;
 }
 

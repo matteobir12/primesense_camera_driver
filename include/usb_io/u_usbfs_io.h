@@ -64,8 +64,8 @@ struct ClassSpecificDescriptor {
 
 enum class TransferType  {
     CONTROL = 0,
-    BULK,
     ISOCHRONOUS,
+    BULK,
     INTERRUPT,
     BULK_STREAM
 };
@@ -168,14 +168,14 @@ class InterfaceForIso {
     ~InterfaceForIso();
     InterfaceForIso(const InterfaceForIso&) = delete;
     InterfaceForIso& operator=(const InterfaceForIso&) = delete;
-    InterfaceForIso(InterfaceForIso&&) = default;
-    InterfaceForIso& operator=(InterfaceForIso&&) = default;
+    InterfaceForIso(InterfaceForIso&& other) noexcept;
+    InterfaceForIso& operator=(InterfaceForIso&& other) noexcept;
 
     TransferError startIsochronousCapture(const IsochronousConfig& cfg);
     TransferError stopIsochronousCapture(uint8_t ep_address);
 
   private:
-    const int fd_ = -1;
+    int fd_ = -1;
     InterfaceDescriptor interface_;
     std::unordered_map<uint8_t, std::pair<std::thread, std::unique_ptr<std::atomic_bool>>>
         ep_addr_to_thread_and_keep_alive_flag_;

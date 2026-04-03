@@ -7,6 +7,7 @@
 int main() {
   PS1080::Driver d;
 
+  d.StreamRGBD();
   // Drivers loaded
   return 0;
 }

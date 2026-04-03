@@ -74,42 +74,31 @@ void Driver::init() {
 
     const auto interfaces = FetchConnectionInterfaces(fd);
     // claim interfaces
-    std::vector<USBIO::InterfaceForIso> active_ifaces;
-    std::vector<USBIO::EndpointDescriptor> receive_endpoints;
+    // todo the bAlternateSetting we're going with needs to be known here
     for (auto& iface : interfaces) {
-        // We should not need to hard code the first interface's endpoints, figure out why
-        // These endpoint were only available on bInterfaceNumber = 0, bAlternateSetting = 0
-        if (iface.bInterfaceNumber != 0 || iface.bAlternateSetting == 0)
+        if (iface.bInterfaceNumber != 0 || iface.bAlternateSetting != 1)
           continue;
-        for (auto& ep : interfaces[0].endpoints) {
-            bool made_iface = false;
+
+        bool made_iface = false;
+        for (auto& ep : iface.endpoints) {
             if (ep.transfer_type == USBIO::TransferType::ISOCHRONOUS &&
                     (ep.bEndpointAddress & 0x80) != 0) {
                 if (!made_iface) {
-                    active_ifaces.emplace_back(fd, iface);
+                    receive_endpoints_.emplace(
+                        InterfaceKey{iface.bInterfaceNumber, iface.bAlternateSetting},
+                        std::make_pair(USBIO::InterfaceForIso{
+                            fd, iface}, std::vector<USBIO::EndpointDescriptor>{}));
                     made_iface = true;
                 }
 
-                USBIO::IsochronousConfig iso_cfg;
-                iso_cfg.ep = ep;
-                iso_cfg.on_packet = [](auto,  auto) { std::cout << "data\n"; };
-                iso_cfg.packets_per_urb = 32;
-                iso_cfg.ring_size = 8;
-                active_ifaces.back().startIsochronousCapture(iso_cfg);
-                receive_endpoints.push_back(ep);
+                receive_endpoints_[InterfaceKey{iface.bInterfaceNumber, iface.bAlternateSetting}]
+                    .second.push_back(ep);
             }
         }
     }
 
-    std::cout << "total receive eps " << receive_endpoints.size() << std::endl;
-    std::cout << "total active ifaces " << active_ifaces.size() << std::endl;
-    if (active_ifaces.size() < 1)
+    if (receive_endpoints_.size() < 1)
       throw std::runtime_error("No receive interfaces");
-
-
-    // looks like some cams support "misc" data, doubt mine does, but check later
-    while (true) {}
-    std::cout << "??\n";
 }
 
 std::string Driver::fetchStringFromST(const int indx) {
@@ -132,6 +121,22 @@ std::string Driver::fetchStringFromST(const int indx) {
         ascii_str[i] = s_buffer[(i * 2) + 2];
 
     return std::string(ascii_str);
+}
+
+void Driver::StreamRGBD()
+{
+    const InterfaceKey key{0, 1};
+    // There should be 2, one for RGB and one for D
+    for (int i = 0; i < receive_endpoints_[key].second.size(); ++i) {
+      USBIO::IsochronousConfig iso_cfg;
+      iso_cfg.ep = receive_endpoints_[key].second[i];
+      iso_cfg.on_packet = [i](auto,  auto) { std::cout << "data " << i << std::endl; };
+      iso_cfg.packets_per_urb = 32;
+      iso_cfg.ring_size = 8;
+      receive_endpoints_[key].first.startIsochronousCapture(iso_cfg);
+    }
+
+    while (true) {}
 }
 
 }
