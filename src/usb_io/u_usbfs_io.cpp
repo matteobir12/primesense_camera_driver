@@ -318,7 +318,17 @@ void IsoWorker(const int fd, const std::atomic_bool& keep_alive, IsochronousConf
         if (!completed || r < 0)
             break;
 
-        cfg.on_packet(static_cast<const uint8_t*>(completed->buffer), completed->buffer_length);
+        std::vector<IscPacketResults> packet_res;
+        for (int p = 0; p < cfg.packets_per_urb; ++p)
+            packet_res.push_back(IscPacketResults{
+                .length = completed->iso_frame_desc[p].length,
+                .actual_length = completed->iso_frame_desc[p].actual_length,
+                .status = completed->iso_frame_desc[p].status});
+
+        cfg.on_packet(
+            static_cast<const std::uint8_t*>(completed->buffer),
+            completed->buffer_length,
+            std::move(packet_res));
 
         r = ioctl(fd, USBDEVFS_SUBMITURB, completed);
         if (r < 0)

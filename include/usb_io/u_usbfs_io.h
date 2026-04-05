@@ -139,6 +139,12 @@ struct Transfer {
     TransferData d;
 };
 
+struct IscPacketResults {
+	unsigned int length = 0;
+	unsigned int actual_length = 0;
+	unsigned int status = ~0;
+};
+
 // optional as error union, empty is error
 std::optional<UsbDeviceDiscriptor> probeUSBDeviceDescriptor(const int fd);
 std::optional<UsbDeviceDiscriptor> probeUSBDeviceDescriptor(const char* const usb_path);
@@ -159,8 +165,10 @@ struct IsochronousConfig {
     EndpointDescriptor ep;
     int packets_per_urb;
     int ring_size; // how many URBs to keep in flight
-    std::function<void(const uint8_t* data, size_t len)> on_packet;
+    std::function<void(const uint8_t* data, size_t len, std::vector<IscPacketResults> packet_info)>
+        on_packet;
 };
+
 class InterfaceForIso {
   public:
     InterfaceForIso() = default;

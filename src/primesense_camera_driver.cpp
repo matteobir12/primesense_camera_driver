@@ -123,18 +123,45 @@ std::string Driver::fetchStringFromST(const int indx) {
     return std::string(ascii_str);
 }
 
+namespace {
+void ImageFromPackets(
+    const uint8_t *data, const std::size_t len, std::vector<USBIO::IscPacketResults> packet_info)
+{
+    std::size_t offset = 0;
+    for (const auto& packet : packet_info) {
+        if (packet.length != packet.actual_length)
+          std::cout << packet.length << " Short packet " << packet.actual_length << std::endl;
+
+        if (packet.status != 0)
+          std::cout << "Bad packet\n";
+
+        offset += packet.length;
+    }
+}
+
+}  // namespace
+
 void Driver::StreamRGBD()
 {
     const InterfaceKey key{0, 1};
     // There should be 2, one for RGB and one for D
-    for (int i = 0; i < receive_endpoints_[key].second.size(); ++i) {
-      USBIO::IsochronousConfig iso_cfg;
-      iso_cfg.ep = receive_endpoints_[key].second[i];
-      iso_cfg.on_packet = [i](auto,  auto) { std::cout << "data " << i << std::endl; };
-      iso_cfg.packets_per_urb = 32;
-      iso_cfg.ring_size = 8;
-      receive_endpoints_[key].first.startIsochronousCapture(iso_cfg);
-    }
+    const auto& ep0 = receive_endpoints_[key].second[0];
+    USBIO::IsochronousConfig iso_cfg;
+    iso_cfg.ep = ep0;
+    iso_cfg.on_packet = ImageFromPackets;
+
+    iso_cfg.packets_per_urb = 32;
+    iso_cfg.ring_size = 8;
+    receive_endpoints_[key].first.startIsochronousCapture(iso_cfg);
+
+    const auto& ep1 = receive_endpoints_[key].second[1];
+    USBIO::IsochronousConfig iso_cfg_2;
+    iso_cfg_2.ep = ep1;
+    iso_cfg_2.on_packet = ImageFromPackets;
+
+    iso_cfg_2.packets_per_urb = 32;
+    iso_cfg_2.ring_size = 8;
+    receive_endpoints_[key].first.startIsochronousCapture(iso_cfg_2);
 
     while (true) {}
 }
