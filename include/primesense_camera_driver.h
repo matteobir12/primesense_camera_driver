@@ -4,6 +4,7 @@
 #include "usb_io/u_usbfs_io.h"
 #include "ps1080_host_protocol.h"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,12 +21,24 @@ class Driver {
     // Try handle as USB dev
     // Needs to be null terminated
     Driver(const char* const handle);
+    ~Driver();
+
+    // Makes StreamDepth/StreamRGBD return. Safe to call from a signal handler.
+    void requestStop() { stop_requested_.store(true); }
 
     std::string fetchStringFromST(const int indx);
     void StreamDepth();
 
+    // Same, but with the color stream (VGA 30fps, uncompressed YUV422)
+    // running alongside depth.
+    void StreamRGBD();
+
   private:
     void init();
+    // Per stream setup: iso capture + firmware params. Don't block;
+    // frames arrive on the iso reaping threads.
+    void startDepthStream();
+    void startColorStream();
     void initFirmware();
 
     struct InterfaceKey {
@@ -45,6 +58,9 @@ class Driver {
         std::vector<USBIO::EndpointDescriptor>>, InterfaceKey::Hasher>
         receive_endpoints_;
     std::unique_ptr<HostProtocol> protocol_;
+    std::atomic<bool> stop_requested_{false};
+    bool depth_running_ = false;
+    bool color_running_ = false;
     int fd = -1; // fd of USB dev or -1 if not init
 };
 

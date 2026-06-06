@@ -51,6 +51,15 @@ class HostProtocol {
         STREAM_MODE_IR = 3,
     };
 
+    // Values for PARAM_IMAGE_FORMAT
+    enum ImageFormat : std::uint16_t {
+        IMAGE_FORMAT_BAYER = 0,
+        IMAGE_FORMAT_YUV422 = 1,
+        IMAGE_FORMAT_JPEG = 2,
+        IMAGE_FORMAT_UNCOMPRESSED_YUV422 = 5,
+        IMAGE_FORMAT_UNCOMPRESSED_BAYER = 6,
+    };
+
     // Values for PARAM_DEPTH_FORMAT
     enum DepthFormat : std::uint16_t {
         DEPTH_FORMAT_UNCOMPRESSED_16_BIT = 0,

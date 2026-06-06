@@ -13,12 +13,25 @@ namespace PS1080 {
 
 std::vector<std::uint16_t> unpack11BitDepth(const std::vector<std::uint8_t>& packed);
 
+// Converts uncompressed YUV422 (UYVY byte order, as the sensor sends it) to
+// RGB888. Returns 3 bytes per pixel, 2 pixels per 4 input bytes.
+std::vector<std::uint8_t> uyvyToRGB888(const std::vector<std::uint8_t>& uyvy);
+
+// Decompresses the PrimeSense YUV422 image compression (firmware format
+// XN_IO_IMAGE_FORMAT_YUV422, the only VGA mode served over the bulk
+// endpoints) into raw UYVY. line_bytes is the uncompressed line stride
+// (width * 2); the codec resets its predictors at every line end.
+// Ported from XnStreamUncompressYUVImagePS in OpenNI2.
+std::vector<std::uint8_t> decompressPSYUV422(
+    const std::vector<std::uint8_t>& compressed, std::uint16_t line_bytes);
+
 class StreamParser {
   public:
-    // Mini-packet types for the depth stream
+    // Mini-packet types per stream
     static constexpr std::uint16_t DEPTH_START = 0x7100;
-    static constexpr std::uint16_t DEPTH_BUFFER = 0x7200;
     static constexpr std::uint16_t DEPTH_END = 0x7500;
+    static constexpr std::uint16_t IMAGE_START = 0x8100;
+    static constexpr std::uint16_t IMAGE_END = 0x8500;
 
     // frame: raw payload bytes as sent by the device (still in the configured
     // input format, e.g. 11 bit packed). timestamp: device clock from the
@@ -26,7 +39,9 @@ class StreamParser {
     using FrameCallback =
         std::function<void(const std::vector<std::uint8_t>& frame, std::uint32_t timestamp)>;
 
-    explicit StreamParser(FrameCallback on_frame) : on_frame_(std::move(on_frame)) {}
+    StreamParser(const std::uint16_t start_type, const std::uint16_t end_type,
+                 FrameCallback on_frame)
+        : start_type_(start_type), end_type_(end_type), on_frame_(std::move(on_frame)) {}
 
     // Feed a contiguous chunk of endpoint data (one iso packet's payload)
     void feed(const std::uint8_t* data, std::size_t len);
@@ -43,6 +58,8 @@ class StreamParser {
 
     void resync();
 
+    std::uint16_t start_type_;
+    std::uint16_t end_type_;
     FrameCallback on_frame_;
 
     State state_ = State::LOOKING_FOR_MAGIC;

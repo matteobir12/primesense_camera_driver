@@ -288,92 +288,10 @@ std::optional<UsbDescriptorTree> getUSBDescriptorTree(const int fd) {
     return out;
 }
 
-namespace {
-void IsoWorker(const int fd, const std::atomic_bool& keep_alive, IsochronousConfig cfg) {
-    const uint16_t raw = cfg.ep.wMaxPacketSize;
-    const uint16_t mps = raw & 0x07FF;
-    const uint16_t mult  = ((raw >> 11) & 0x3) + 1; // high order is multiplier
-    const uint16_t packet_size = mps * mult;
-
-    const std::size_t packet_data_size =  packet_size * cfg.packets_per_urb;
-    const std::size_t usbdevfs_urb_total_size =
-        (sizeof(usbdevfs_iso_packet_desc) * cfg.packets_per_urb) + sizeof(usbdevfs_urb);
-    const std::size_t buffer_ptr_array_size = sizeof(usbdevfs_urb*) * cfg.ring_size;
-
-    usbdevfs_urb** buffer_ptr_array = static_cast<usbdevfs_urb**>(malloc(buffer_ptr_array_size));
-    if (!buffer_ptr_array)
-        throw std::runtime_error("null!");
-
-    int r = 0;
-    int init_buffs = 0;
-    for (int i = 0; i < cfg.ring_size; ++i) {
-        buffer_ptr_array[i] = static_cast<usbdevfs_urb*>(malloc(usbdevfs_urb_total_size));
-
-        if (!buffer_ptr_array[i])
-            throw std::runtime_error("null!");
-
-        std::memset(buffer_ptr_array[i], 0, usbdevfs_urb_total_size);
-        buffer_ptr_array[i]->type = USBDEVFS_URB_TYPE_ISO;
-        buffer_ptr_array[i]->endpoint = cfg.ep.bEndpointAddress;
-        buffer_ptr_array[i]->number_of_packets = cfg.packets_per_urb;
-        buffer_ptr_array[i]->buffer = malloc(packet_data_size);
-        buffer_ptr_array[i]->buffer_length = packet_data_size;
-
-        init_buffs += 1;
-
-        for (int p = 0; p < cfg.packets_per_urb; ++p) {
-            buffer_ptr_array[i]->iso_frame_desc[p].length = packet_size;
-            buffer_ptr_array[i]->iso_frame_desc[p].actual_length = 0;
-            buffer_ptr_array[i]->iso_frame_desc[p].status = 0;
-        }
-
-        buffer_ptr_array[i]->flags = USBDEVFS_URB_ISO_ASAP;
-
-        r = ioctl(fd, USBDEVFS_SUBMITURB, buffer_ptr_array[i]);
-        if (r < 0) {
-            std::cout << errno << std::endl;
-            break;  // ERROR
-        }
-    }
-
-    while (r >= 0 && keep_alive.load()) {
-        usbdevfs_urb* completed = nullptr;
-        r = ioctl(fd, USBDEVFS_REAPURB, &completed);
-        if (!completed || r < 0)
-            break;
-
-        std::vector<IscPacketResults> packet_res;
-        for (int p = 0; p < cfg.packets_per_urb; ++p)
-            packet_res.push_back(IscPacketResults{
-                .length = completed->iso_frame_desc[p].length,
-                .actual_length = completed->iso_frame_desc[p].actual_length,
-                .status = completed->iso_frame_desc[p].status});
-
-        cfg.on_packet(
-            static_cast<const std::uint8_t*>(completed->buffer),
-            completed->buffer_length,
-            std::move(packet_res));
-
-        r = ioctl(fd, USBDEVFS_SUBMITURB, completed);
-        if (r < 0)
-            break;
-    }
-
-    if (r < 0)
-        std::printf("ERROR %d %d\n", r, init_buffs);
-
-    for (int i = 0; i < init_buffs; ++i) {
-        free(buffer_ptr_array[i]->buffer);
-        free(buffer_ptr_array[i]);
-    }
-
-    free(buffer_ptr_array);
-}
-
-}
-
 InterfaceForIso::InterfaceForIso(const int fd, const InterfaceDescriptor& interface)
-    : fd_(fd), interface_(interface)
+    : fd_(fd), interface_(interface),
+      keep_alive_(std::make_unique<std::atomic_bool>(true)),
+      captures_mutex_(std::make_unique<std::mutex>())
 {
     usbdevfs_ioctl cmd{
         .ifno = interface_.bInterfaceNumber,
@@ -402,19 +320,35 @@ InterfaceForIso::InterfaceForIso(const int fd, const InterfaceDescriptor& interf
 
 InterfaceForIso::InterfaceForIso(InterfaceForIso&& other) noexcept
     : fd_(other.fd_), interface_(std::move(other.interface_)),
-      ep_addr_to_thread_and_keep_alive_flag_(
-          std::move(other.ep_addr_to_thread_and_keep_alive_flag_))
+      reaper_(std::move(other.reaper_)),
+      keep_alive_(std::move(other.keep_alive_)),
+      captures_mutex_(std::move(other.captures_mutex_)),
+      captures_(std::move(other.captures_)),
+      bulk_readers_(std::move(other.bulk_readers_))
 { other.fd_ = -1; }
 
 InterfaceForIso& InterfaceForIso::operator=(InterfaceForIso&& other) noexcept {
     if (this != &other) {
         fd_ = other.fd_;
         interface_ = std::move(other.interface_);
-        ep_addr_to_thread_and_keep_alive_flag_ =
-            std::move(other.ep_addr_to_thread_and_keep_alive_flag_);
+        reaper_ = std::move(other.reaper_);
+        keep_alive_ = std::move(other.keep_alive_);
+        captures_mutex_ = std::move(other.captures_mutex_);
+        captures_ = std::move(other.captures_);
+        bulk_readers_ = std::move(other.bulk_readers_);
         other.fd_ = -1;
     }
     return *this;
+}
+
+void InterfaceForIso::freeCapture(EpCapture& capture)
+{
+    for (usbdevfs_urb* const urb : capture.urbs) {
+        ioctl(fd_, USBDEVFS_DISCARDURB, urb);
+        free(urb->buffer);
+        free(urb);
+    }
+    capture.urbs.clear();
 }
 
 InterfaceForIso::~InterfaceForIso()
@@ -422,42 +356,166 @@ InterfaceForIso::~InterfaceForIso()
   if (fd_ < 0)
     return;
 
-  for (const auto& running_trans : ep_addr_to_thread_and_keep_alive_flag_)
-    stopIsochronousCapture(running_trans.first);
+  if (keep_alive_)
+      keep_alive_->store(false);
+
+  // There is a deadlock if USBDEVFS_REAPURB hangs indefinitely; discarding the
+  // URBs makes them complete (with error status) so the reaper wakes up.
+  {
+      std::lock_guard<std::mutex> lock(*captures_mutex_);
+      for (auto& [ep, capture] : captures_)
+          for (usbdevfs_urb* const urb : capture.urbs)
+              ioctl(fd_, USBDEVFS_DISCARDURB, urb);
+  }
+
+  if (reaper_.joinable())
+      reaper_.join();
+
+  // bulk readers exit on their own within the read timeout
+  for (auto& reader : bulk_readers_)
+      if (reader.joinable())
+          reader.join();
+
+  for (auto& [ep, capture] : captures_)
+      freeCapture(capture);
 
   const int interface_num = interface_.bInterfaceNumber;
   ioctl(fd_, USBDEVFS_RELEASEINTERFACE, &interface_num);
 }
 
-TransferError InterfaceForIso::startIsochronousCapture(const IsochronousConfig& cfg)
+TransferError InterfaceForIso::startBulkCapture(const BulkCaptureConfig& cfg)
 {
-    auto pair_it = ep_addr_to_thread_and_keep_alive_flag_.emplace(
-        cfg.ep.bEndpointAddress,
-        std::make_pair(
-            std::thread{},
-            std::make_unique<std::atomic_bool>(true)));
+    if (!cfg.on_data || cfg.chunk_bytes <= 0)
+        return TransferError::ERROR;
 
-    if (!pair_it.second || pair_it.first == ep_addr_to_thread_and_keep_alive_flag_.cend())
-      return TransferError::ERROR;
+    bulk_readers_.emplace_back(
+        [fd = fd_, keep_alive = keep_alive_.get(), cfg]() {
+            std::vector<std::uint8_t> buf(cfg.chunk_bytes);
 
-    const std::atomic_bool& keep_alive = *pair_it.first->second.second;
-    pair_it.first->second.first =
-        std::thread(IsoWorker, fd_, std::cref(keep_alive), cfg);
+            while (keep_alive->load()) {
+                usbdevfs_bulktransfer bt;
+                std::memset(&bt, 0, sizeof(bt));
+                bt.ep = cfg.ep.bEndpointAddress;
+                bt.len = buf.size();
+                bt.timeout = 1000;  // ms; loop to check keep_alive
+                bt.data = buf.data();
+
+                const int r = ioctl(fd, USBDEVFS_BULK, &bt);
+                if (r > 0)
+                    cfg.on_data(buf.data(), r);
+                else if (r < 0 && errno != ETIMEDOUT && errno != EAGAIN && errno != EINTR)
+                    break;  // device gone
+            }
+        });
+
     return TransferError::SUCCESS;
 }
 
-// There is a deadlock if USBDEVFS_REAPURB hangs indefinitely, this will wait to join and
-// USBDEVFS_REAPURB will hang (which is very possible).
-// For now don't care as build up is more important than teardown.
+TransferError InterfaceForIso::startIsochronousCapture(const IsochronousConfig& cfg)
+{
+    const uint16_t raw = cfg.ep.wMaxPacketSize;
+    const uint16_t mps = raw & 0x07FF;
+    const uint16_t mult = ((raw >> 11) & 0x3) + 1; // high order is multiplier
+    const uint16_t packet_size = mps * mult;
+
+    const std::size_t packet_data_size = packet_size * cfg.packets_per_urb;
+    const std::size_t usbdevfs_urb_total_size =
+        (sizeof(usbdevfs_iso_packet_desc) * cfg.packets_per_urb) + sizeof(usbdevfs_urb);
+
+    EpCapture capture;
+    capture.cfg = cfg;
+
+    for (int i = 0; i < cfg.ring_size; ++i) {
+        usbdevfs_urb* const urb = static_cast<usbdevfs_urb*>(malloc(usbdevfs_urb_total_size));
+        if (!urb)
+            throw std::runtime_error("null!");
+
+        std::memset(urb, 0, usbdevfs_urb_total_size);
+        urb->type = USBDEVFS_URB_TYPE_ISO;
+        urb->endpoint = cfg.ep.bEndpointAddress;
+        urb->number_of_packets = cfg.packets_per_urb;
+        urb->buffer = malloc(packet_data_size);
+        urb->buffer_length = packet_data_size;
+        urb->flags = USBDEVFS_URB_ISO_ASAP;
+
+        for (int p = 0; p < cfg.packets_per_urb; ++p)
+            urb->iso_frame_desc[p].length = packet_size;
+
+        capture.urbs.push_back(urb);
+
+        if (ioctl(fd_, USBDEVFS_SUBMITURB, urb) < 0) {
+            std::cout << "SUBMITURB failed: " << strerror(errno) << std::endl;
+            freeCapture(capture);
+            return TransferError::ERROR;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(*captures_mutex_);
+        if (captures_.count(cfg.ep.bEndpointAddress)) {
+            freeCapture(capture);
+            return TransferError::ERROR;  // already capturing on this ep
+        }
+
+        captures_.emplace(cfg.ep.bEndpointAddress, std::move(capture));
+    }
+
+    if (!reaper_.joinable())
+        reaper_ = std::thread(&InterfaceForIso::reaperLoop, this);
+
+    return TransferError::SUCCESS;
+}
+
+void InterfaceForIso::reaperLoop()
+{
+    while (keep_alive_->load()) {
+        usbdevfs_urb* completed = nullptr;
+        const int r = ioctl(fd_, USBDEVFS_REAPURB, &completed);
+        if (r < 0 || !completed) {
+            if (errno == EINTR)
+                continue;
+            break;  // device gone or fd closed
+        }
+
+        // route by endpoint; REAPURB hands back completions for the whole fd
+        IsochronousConfig* cfg = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*captures_mutex_);
+            const auto it = captures_.find(completed->endpoint);
+            if (it != captures_.end())
+                cfg = &it->second.cfg;
+        }
+
+        if (!cfg)
+            continue;  // capture was stopped, urb already freed/discarded
+
+        std::vector<IscPacketResults> packet_res;
+        packet_res.reserve(completed->number_of_packets);
+        for (int p = 0; p < completed->number_of_packets; ++p)
+            packet_res.push_back(IscPacketResults{
+                .length = completed->iso_frame_desc[p].length,
+                .actual_length = completed->iso_frame_desc[p].actual_length,
+                .status = completed->iso_frame_desc[p].status});
+
+        cfg->on_packet(
+            static_cast<const std::uint8_t*>(completed->buffer),
+            completed->buffer_length,
+            std::move(packet_res));
+
+        if (ioctl(fd_, USBDEVFS_SUBMITURB, completed) < 0)
+            std::cout << "iso resubmit failed: " << strerror(errno) << std::endl;
+    }
+}
+
 TransferError InterfaceForIso::stopIsochronousCapture(uint8_t ep_address)
 {
-    const auto it = ep_addr_to_thread_and_keep_alive_flag_.find( ep_address);
-    if (it == ep_addr_to_thread_and_keep_alive_flag_.cend())
+    std::lock_guard<std::mutex> lock(*captures_mutex_);
+    const auto it = captures_.find(ep_address);
+    if (it == captures_.cend())
         return TransferError::ERROR;
 
-    it->second.second->store(false);
-    if (it->second.first.joinable())
-        it->second.first.join();
+    freeCapture(it->second);
+    captures_.erase(it);
 
     return TransferError::SUCCESS;
 }

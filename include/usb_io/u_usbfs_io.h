@@ -4,9 +4,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+struct usbdevfs_urb;  // <linux/usbdevice_fs.h>
 
 // following naming convention from USB 2.0 doc
 struct __attribute__((packed)) UsbDeviceDiscriptor {
@@ -177,6 +181,13 @@ struct IsochronousConfig {
         on_packet;
 };
 
+struct BulkCaptureConfig {
+    EndpointDescriptor ep;
+    int chunk_bytes = 16 * 1024;  // per read; old kernels cap usbfs bulk at 16K
+    // bulk is reliable transport, data arrives in order with no holes
+    std::function<void(const uint8_t* data, size_t len)> on_data;
+};
+
 class InterfaceForIso {
   public:
     InterfaceForIso() = default;
@@ -190,11 +201,30 @@ class InterfaceForIso {
     TransferError startIsochronousCapture(const IsochronousConfig& cfg);
     TransferError stopIsochronousCapture(uint8_t ep_address);
 
+    // Continuously reads the bulk IN endpoint on a dedicated thread.
+    // Runs until destruction.
+    TransferError startBulkCapture(const BulkCaptureConfig& cfg);
+
   private:
+    // USBDEVFS_REAPURB returns any completed URB on the fd, regardless of
+    // endpoint, so a single thread reaps for the whole interface and
+    // dispatches by urb->endpoint.
+    struct EpCapture {
+        IsochronousConfig cfg;
+        // owned URBs (each with an owned data buffer), kept submitted
+        std::vector<::usbdevfs_urb*> urbs;
+    };
+
+    void reaperLoop();
+    void freeCapture(EpCapture& capture);
+
     int fd_ = -1;
     InterfaceDescriptor interface_;
-    std::unordered_map<uint8_t, std::pair<std::thread, std::unique_ptr<std::atomic_bool>>>
-        ep_addr_to_thread_and_keep_alive_flag_;
+    std::thread reaper_;
+    std::unique_ptr<std::atomic_bool> keep_alive_;
+    std::unique_ptr<std::mutex> captures_mutex_;
+    std::unordered_map<uint8_t, EpCapture> captures_;
+    std::vector<std::thread> bulk_readers_;
 };
 
 }

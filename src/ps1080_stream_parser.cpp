@@ -98,7 +98,7 @@ void StreamParser::feed(const std::uint8_t* data, std::size_t len) {
         last_packet_id_ = packet_id;
         have_last_packet_id_ = true;
 
-        if (cur_type_ == DEPTH_START) {
+        if (cur_type_ == start_type_) {
           frame_.clear();
           in_frame_ = true;
           frame_corrupt_ = false;
@@ -120,7 +120,7 @@ void StreamParser::feed(const std::uint8_t* data, std::size_t len) {
         data_remaining_ -= take;
 
         if (data_remaining_ == 0) {
-          if (cur_type_ == DEPTH_END) {
+          if (cur_type_ == end_type_) {
             if (in_frame_ && !frame_corrupt_ && on_frame_)
                 on_frame_(frame_, cur_timestamp_);
             in_frame_ = false;
@@ -131,6 +131,117 @@ void StreamParser::feed(const std::uint8_t* data, std::size_t len) {
       }
     }
   }
+}
+
+namespace {
+// ITU-R BT.601 integer conversion, same coefficients as OpenNI2's YUV444ToRGB888
+void yuvToRGB(const std::uint8_t y, const std::uint8_t u, const std::uint8_t v,
+              std::uint8_t* const rgb) {
+    const std::int32_t c = (y - 16) * 298 + 128;
+    const std::int32_t d = u - 128;
+    const std::int32_t e = v - 128;
+
+    const auto clamp = [](const std::int32_t x) {
+        return static_cast<std::uint8_t>(std::min(std::max(x, 0), 255));
+    };
+
+    rgb[0] = clamp((c           + 409 * e) >> 8);
+    rgb[1] = clamp((c - 100 * d - 208 * e) >> 8);
+    rgb[2] = clamp((c + 516 * d          ) >> 8);
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> uyvyToRGB888(const std::vector<std::uint8_t>& uyvy) {
+    std::vector<std::uint8_t> rgb((uyvy.size() / 4) * 6);
+
+    std::size_t o = 0;
+    for (std::size_t i = 0; i + 3 < uyvy.size(); i += 4) {
+        const std::uint8_t u = uyvy[i], y1 = uyvy[i + 1], v = uyvy[i + 2], y2 = uyvy[i + 3];
+        yuvToRGB(y1, u, v, &rgb[o]);
+        yuvToRGB(y2, u, v, &rgb[o + 3]);
+        o += 6;
+    }
+
+    return rgb;
+}
+
+std::vector<std::uint8_t> decompressPSYUV422(
+    const std::vector<std::uint8_t>& compressed, const std::uint16_t line_bytes) {
+    // The stream is a sequence of 4 bit elements, one per output byte:
+    //   0x0..0xc: delta of -6..+6 against the channel's last value
+    //   0xd:      dummy (padding)
+    //   0xf:      full value follows in the next 8 bits
+    // Channels cycle U,Y1,V,Y2 with the two Y predictors linked, and all
+    // predictors reset at the end of each output line.
+    std::vector<std::uint8_t> out;
+    out.reserve(compressed.size() * 4);
+
+    std::uint8_t last_full[4] = {0, 0, 0, 0};
+    bool high_nibble = true;
+    std::uint32_t channel = 0;
+    std::uint32_t cur_line_bytes = 0;
+
+    const std::uint8_t* p = compressed.data();
+    const std::uint8_t* const end = p + compressed.size();
+
+    while (p < end) {
+        const std::uint32_t c = *p;
+
+        if (high_nibble) {
+            high_nibble = false;
+
+            if (c < 0xd0) {
+                last_full[channel] += static_cast<std::int8_t>((c >> 4) - 6);
+            } else if (c < 0xe0) {
+                continue;  // dummy, low nibble processed next iteration
+            } else {
+                // full value: low nibble of this byte + high nibble of next
+                std::uint32_t value = (c & 0x0f) << 4;
+                if (++p == end)
+                    break;
+
+                value += (*p >> 4);
+                last_full[channel] = static_cast<std::uint8_t>(value);
+            }
+        } else {
+            const std::uint32_t nibble = c & 0x0f;
+            high_nibble = true;
+            p++;
+
+            if (nibble < 0xd) {
+                last_full[channel] += static_cast<std::int8_t>(nibble - 6);
+            } else if (nibble < 0xe) {
+                continue;  // dummy
+            } else {
+                if (p == end)
+                    break;
+
+                last_full[channel] = *p;  // full value is the entire next byte
+                p++;
+            }
+        }
+
+        out.push_back(last_full[channel]);
+
+        channel++;
+        switch (channel) {
+            case 2:
+                last_full[3] = last_full[1];
+                break;
+            case 4:
+                last_full[1] = last_full[3];
+                channel = 0;
+                break;
+        }
+
+        if (++cur_line_bytes == line_bytes) {
+            last_full[0] = last_full[1] = last_full[2] = last_full[3] = 0;
+            cur_line_bytes = 0;
+        }
+    }
+
+    return out;
 }
 
 std::vector<std::uint16_t> unpack11BitDepth(const std::vector<std::uint8_t>& packed) {
