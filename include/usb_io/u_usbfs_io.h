@@ -156,6 +156,14 @@ void closeUSBDEV(const int fd);
 
 TransferError transfer(Transfer* const transfer);
 
+// Synchronous control transfer on EP0. Direction/type come from bRequestType.
+// Returns bytes transferred on success, negative errno style value on failure.
+int controlTransfer(
+    const int fd, const uint8_t bRequestType, const uint8_t bRequest,
+    const uint16_t wValue, const uint16_t wIndex,
+    void* const data, const uint16_t wLength,
+    const uint32_t timeout_ms = 1000);
+
 void transferForUSBString(Transfer* const transfer, const int index, const char* str_buff, const int str_buff_len);
 void transferForConfigDescriptor(Transfer* const transfer, const unsigned char* buff, const int buff_len = sizeof(UsbConfigDiscriptor));
 void transferForBulk(Transfer* const transfer, const unsigned int ep, void* const buff, const int buff_len, const unsigned int timeout = 100);

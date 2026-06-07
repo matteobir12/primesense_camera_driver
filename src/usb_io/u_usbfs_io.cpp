@@ -111,6 +111,30 @@ TransferError transfer(Transfer* const transfer) {
     return TransferError::ERROR;
 }
 
+int controlTransfer(
+    const int fd, const uint8_t bRequestType, const uint8_t bRequest,
+    const uint16_t wValue, const uint16_t wIndex,
+    void* const data, const uint16_t wLength,
+    const uint32_t timeout_ms)
+{
+  usbdevfs_ctrltransfer ctrl;
+  std::memset(&ctrl, 0, sizeof(ctrl));
+
+  ctrl.bRequestType = bRequestType;
+  ctrl.bRequest = bRequest;
+  ctrl.wValue = wValue;
+  ctrl.wIndex = wIndex;
+  ctrl.wLength = wLength;
+  ctrl.timeout = timeout_ms;
+  ctrl.data = data;
+
+  const int r = ioctl(fd, USBDEVFS_CONTROL, &ctrl);
+  if (r < 0)
+      return -errno;
+
+  return r;
+}
+
 void transferForUSBString(Transfer* const transfer, const int index, const char* str_buff, const int str_buff_len) {
     auto* ctrl = (usbdevfs_ctrltransfer*) transfer->d.buffer;
     std::memset(ctrl, 0, sizeof(usbdevfs_ctrltransfer));
