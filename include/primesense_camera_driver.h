@@ -2,7 +2,9 @@
 #pragma once
 
 #include "usb_io/u_usbfs_io.h"
+#include "ps1080_host_protocol.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -20,9 +22,11 @@ class Driver {
     Driver(const char* const handle);
 
     std::string fetchStringFromST(const int indx);
-    void StreamRGBD();
+    void StreamDepth();
+
   private:
     void init();
+    void initFirmware();
 
     struct InterfaceKey {
       std::uint8_t interface_num = -1;
@@ -40,6 +44,7 @@ class Driver {
     std::unordered_map<InterfaceKey, std::pair<USBIO::InterfaceForIso,
         std::vector<USBIO::EndpointDescriptor>>, InterfaceKey::Hasher>
         receive_endpoints_;
+    std::unique_ptr<HostProtocol> protocol_;
     int fd = -1; // fd of USB dev or -1 if not init
 };
 

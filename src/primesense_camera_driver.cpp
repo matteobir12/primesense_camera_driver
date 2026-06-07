@@ -1,11 +1,16 @@
 #include "primesense_camera_driver.h"
 
+#include "ps1080_stream_parser.h"
+
 // likely debug only
 #include <iostream>
 
 #include <stdexcept>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <glob.h>
+#include <thread>
 #include <utility>
 #include <array>
 #include <algorithm>
@@ -17,6 +22,16 @@ constexpr std::array<std::pair<std::uint16_t, std::uint16_t>, 1> SUPPORTED_DEVS 
 };
 
 constexpr const char* USB_PATH = "/dev/bus/usb/**/*";
+
+// FW >= 5.5: alt 0 carries the bulk endpoints, alt 1 the iso ones
+constexpr std::uint8_t DATA_INTERFACE = 0;
+constexpr std::uint8_t ISO_ALT_SETTING = 1;
+
+constexpr std::uint8_t DEPTH_EP = 0x81;  // FW >= 5.x; image is 0x82
+
+constexpr std::uint16_t DEPTH_WIDTH = 640;
+constexpr std::uint16_t DEPTH_HEIGHT = 480;
+constexpr std::uint16_t DEPTH_FPS = 30;
 
 std::vector<USBIO::InterfaceDescriptor> FetchConnectionInterfaces(const int fd) {
     const auto dt = USBIO::getUSBDescriptorTree(fd);
@@ -72,11 +87,14 @@ void Driver::init() {
         dev_desc->bNumConfigurations != 1 /* Expect 1 config */)
         throw std::runtime_error("Bad data from USB dev");
 
+    // talk to the firmware before touching interfaces; the handshake runs on
+    // EP0 and the soft reset would clobber an already configured alt setting
+    initFirmware();
+
     const auto interfaces = FetchConnectionInterfaces(fd);
     // claim interfaces
-    // todo the bAlternateSetting we're going with needs to be known here
     for (auto& iface : interfaces) {
-        if (iface.bInterfaceNumber != 0 || iface.bAlternateSetting != 1)
+        if (iface.bInterfaceNumber != DATA_INTERFACE || iface.bAlternateSetting != ISO_ALT_SETTING)
           continue;
 
         bool made_iface = false;
@@ -99,6 +117,52 @@ void Driver::init() {
 
     if (receive_endpoints_.size() < 1)
       throw std::runtime_error("No receive interfaces");
+}
+
+// Mirrors XnSensorFirmware::Init in OpenNI2
+void Driver::initFirmware() {
+    protocol_ = std::make_unique<HostProtocol>(fd);
+
+    FWVersion ver;
+    if (!protocol_->getVersion(ver))
+        throw std::runtime_error("PS1080 GET_VERSION failed");
+
+    std::cout << "PS1080 firmware " << static_cast<int>(ver.major) << "."
+              << static_cast<int>(ver.minor) << "." << ver.build
+              << " (chip 0x" << std::hex << ver.chip << std::dec << ")" << std::endl;
+
+    if (ver.major != 5)
+        throw std::runtime_error("Only the 5.x firmware protocol is implemented");
+
+    std::uint16_t mode = 0;
+    if (!protocol_->getMode(mode))
+        throw std::runtime_error("PS1080 GET_MODE failed");
+    if (mode == HostProtocol::MODE_SAFE_MODE)
+        throw std::runtime_error("Device is in safe mode, cannot stream");
+
+    bool alive = false;
+    for (int i = 0; i < 5 && !alive; i++)
+        alive = protocol_->keepAlive();
+    if (!alive)
+        throw std::runtime_error("PS1080 keep alive failed");
+
+    // soft reset so the firmware starts from a clean state
+    protocol_->setModeNoAck(HostProtocol::MODE_SOFT_RESET);
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+    alive = false;
+    for (int i = 0; i < 10 && !alive; i++) {
+        alive = protocol_->keepAlive();
+        if (!alive)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!alive)
+        throw std::runtime_error("PS1080 did not come back from soft reset");
+
+    if (!protocol_->getMode(mode) || mode == HostProtocol::MODE_SAFE_MODE)
+        throw std::runtime_error("Bad device mode after soft reset");
+
+    std::cout << "PS1080 firmware initialized (mode " << mode << ")" << std::endl;
 }
 
 std::string Driver::fetchStringFromST(const int indx) {
@@ -124,46 +188,100 @@ std::string Driver::fetchStringFromST(const int indx) {
 }
 
 namespace {
-void ImageFromPackets(
-    const uint8_t *data, const std::size_t len, std::vector<USBIO::IscPacketResults> packet_info)
-{
-    std::size_t offset = 0;
-    for (const auto& packet : packet_info) {
-        if (packet.length != packet.actual_length)
-          std::cout << packet.length << " Short packet " << packet.actual_length << std::endl;
+void SaveFramePGM(const char* const path, const std::vector<std::uint16_t>& px) {
+    FILE* const f = std::fopen(path, "wb");
+    if (!f)
+        return;
 
-        if (packet.status != 0)
-          std::cout << "Bad packet\n";
+    std::fprintf(f, "P5\n%d %d\n2047\n", DEPTH_WIDTH, DEPTH_HEIGHT);
+    for (const std::uint16_t v : px) {
+        // PGM 16 bit is big endian
+        const std::uint8_t be[2] = {
+            static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v & 0xff)};
+        std::fwrite(be, 1, 2, f);
+    }
+    std::fclose(f);
+}
 
-        offset += packet.length;
+void OnDepthFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp) {
+    static int frame_count = 0;
+    frame_count++;
+
+    const auto px = unpack11BitDepth(frame);
+
+    std::uint16_t min_v = 0x7ff, max_v = 0;
+    for (const std::uint16_t v : px) {
+        if (v != 0 && v < min_v) min_v = v;  // 0 == no reading
+        if (v > max_v) max_v = v;
+    }
+
+    const std::size_t expected = DEPTH_WIDTH * DEPTH_HEIGHT;
+    const std::uint16_t center =
+        px.size() == expected ? px[(DEPTH_HEIGHT / 2) * DEPTH_WIDTH + DEPTH_WIDTH / 2] : 0;
+
+    std::printf("depth frame %d: %zu bytes -> %zu px (expect %zu), ts %u, "
+                "shift min/max %u/%u, center %u\n",
+                frame_count, frame.size(), px.size(), expected, timestamp,
+                min_v, max_v, center);
+
+    if (frame_count % 30 == 0 && px.size() == expected) {
+        SaveFramePGM("/tmp/ps1080_depth.pgm", px);
+        std::printf("wrote /tmp/ps1080_depth.pgm\n");
     }
 }
 
 }  // namespace
 
-void Driver::StreamRGBD()
+void Driver::StreamDepth()
 {
-    const InterfaceKey key{0, 1};
-    // There should be 2, one for RGB and one for D
-    const auto& ep0 = receive_endpoints_[key].second[0];
-    USBIO::IsochronousConfig iso_cfg;
-    iso_cfg.ep = ep0;
-    iso_cfg.on_packet = ImageFromPackets;
+    const InterfaceKey key{DATA_INTERFACE, ISO_ALT_SETTING};
+    const auto& eps = receive_endpoints_[key].second;
+    const auto depth_ep_it = std::find_if(eps.begin(), eps.end(),
+        [](const auto& ep) { return ep.bEndpointAddress == DEPTH_EP; });
+    if (depth_ep_it == eps.end())
+        throw std::runtime_error("No depth iso endpoint");
 
+    // parser is shared with the iso reaping thread; it lives as long as
+    // this function never returns
+    auto parser = std::make_shared<StreamParser>(OnDepthFrame);
+
+    USBIO::IsochronousConfig iso_cfg;
+    iso_cfg.ep = *depth_ep_it;
     iso_cfg.packets_per_urb = 32;
     iso_cfg.ring_size = 8;
+    iso_cfg.on_packet = [parser](
+        const uint8_t* data, size_t /*len*/, std::vector<USBIO::IscPacketResults> packets) {
+        std::size_t offset = 0;
+        for (const auto& packet : packets) {
+            if (packet.status != 0)
+                parser->markPacketLost();
+            else if (packet.actual_length > 0)
+                parser->feed(data + offset, packet.actual_length);
+
+            offset += packet.length;
+        }
+    };
+
+    // listen before turning the stream on so nothing is missed
     receive_endpoints_[key].first.startIsochronousCapture(iso_cfg);
 
-    const auto& ep1 = receive_endpoints_[key].second[1];
-    USBIO::IsochronousConfig iso_cfg_2;
-    iso_cfg_2.ep = ep1;
-    iso_cfg_2.on_packet = ImageFromPackets;
+    // configure and start the depth stream (XnSensorDepthStream in OpenNI2)
+    if (!protocol_->setParam(HostProtocol::PARAM_DEPTH_FORMAT,
+                             HostProtocol::DEPTH_FORMAT_UNCOMPRESSED_11_BIT) ||
+        !protocol_->setParam(HostProtocol::PARAM_DEPTH_RESOLUTION,
+                             HostProtocol::RESOLUTION_VGA) ||
+        !protocol_->setParam(HostProtocol::PARAM_DEPTH_FPS, DEPTH_FPS) ||
+        !protocol_->setParam(HostProtocol::PARAM_DEPTH_HOLE_FILTER, 1))
+        throw std::runtime_error("Failed to configure depth stream");
 
-    iso_cfg_2.packets_per_urb = 32;
-    iso_cfg_2.ring_size = 8;
-    receive_endpoints_[key].first.startIsochronousCapture(iso_cfg_2);
+    if (!protocol_->setParam(HostProtocol::PARAM_GENERAL_STREAM1_MODE,
+                             HostProtocol::STREAM_MODE_DEPTH))
+        throw std::runtime_error("Failed to start depth stream");
 
-    while (true) {}
+    std::cout << "Depth stream started" << std::endl;
+
+    while (true)
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 
 }
