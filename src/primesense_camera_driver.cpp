@@ -1,7 +1,5 @@
 #include "primesense_camera_driver.h"
 
-#include "ps1080_stream_parser.h"
-
 // likely debug only
 #include <iostream>
 
@@ -51,7 +49,97 @@ std::vector<USBIO::InterfaceDescriptor> FetchConnectionInterfaces(const int fd) 
     return cfg.interfaces;
 }
 
+void SaveFramePGM(const char* const path, const std::vector<std::uint16_t>& px) {
+    FILE* const f = std::fopen(path, "wb");
+    if (!f)
+        return;
+
+    std::fprintf(f, "P5\n%d %d\n2047\n", STREAM_WIDTH, STREAM_HEIGHT);
+    for (const std::uint16_t v : px) {
+        // PGM 16 bit is big endian
+        const std::uint8_t be[2] = {
+            static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v & 0xff)};
+        std::fwrite(be, 1, 2, f);
+    }
+    std::fclose(f);
 }
+
+void SaveFramePPM(const char* const path, const std::vector<std::uint8_t>& rgb) {
+    FILE* const f = std::fopen(path, "wb");
+    if (!f)
+        return;
+
+    std::fprintf(f, "P6\n%d %d\n255\n", STREAM_WIDTH, STREAM_HEIGHT);
+    std::fwrite(rgb.data(), 1, rgb.size(), f);
+    std::fclose(f);
+}
+
+// Frame callbacks run on the URB reaping thread; anything slow there (pixel
+// conversion, disk writes) delays URB resubmission and the iso ring
+// under-runs. This hands completed frames to a dedicated thread instead.
+class FrameWorker {
+  public:
+    explicit FrameWorker(StreamParser::FrameCallback cb)
+        : cb_(std::move(cb)), thread_([this] { loop(); }) {}
+
+    // joins the processing thread; a detached thread would still be blocked
+    // on cv_ when the members get destroyed (UB, hangs in glibc)
+    ~FrameWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+    }
+
+    void push(const std::vector<std::uint8_t>& frame, const std::uint32_t ts) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.size() >= 4)  // backlogged; drop rather than stall
+            return;
+
+        queue_.emplace_back(frame, ts);
+        cv_.notify_one();
+    }
+
+  private:
+    void loop() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+            if (stop_)
+                return;
+
+            const auto [frame, ts] = std::move(queue_.front());
+            queue_.pop_front();
+            lock.unlock();
+
+            cb_(frame, ts);
+        }
+    }
+
+    StreamParser::FrameCallback cb_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::pair<std::vector<std::uint8_t>, std::uint32_t>> queue_;
+    bool stop_ = false;
+    std::thread thread_;  // last member: starts after everything it touches
+};
+
+USBIO::BulkCaptureConfig MakeBulkConfig(
+    const USBIO::EndpointDescriptor& ep, std::shared_ptr<StreamParser> parser) {
+    USBIO::BulkCaptureConfig cfg;
+    cfg.ep = ep;
+    // parser is shared with the reading thread; it lives as long as the
+    // capture does (the driver never tears streams down)
+    cfg.on_data = [parser = std::move(parser)](const uint8_t* data, size_t len) {
+        parser->feed(data, len);
+    };
+
+    return cfg;
+}
+
+}  // namespace
 
 Driver::Driver() {
     glob_t usb_devs_glob;
@@ -213,33 +301,7 @@ std::string Driver::fetchStringFromST(const int indx) {
     return std::string(ascii_str);
 }
 
-namespace {
-void SaveFramePGM(const char* const path, const std::vector<std::uint16_t>& px) {
-    FILE* const f = std::fopen(path, "wb");
-    if (!f)
-        return;
-
-    std::fprintf(f, "P5\n%d %d\n2047\n", STREAM_WIDTH, STREAM_HEIGHT);
-    for (const std::uint16_t v : px) {
-        // PGM 16 bit is big endian
-        const std::uint8_t be[2] = {
-            static_cast<std::uint8_t>(v >> 8), static_cast<std::uint8_t>(v & 0xff)};
-        std::fwrite(be, 1, 2, f);
-    }
-    std::fclose(f);
-}
-
-void SaveFramePPM(const char* const path, const std::vector<std::uint8_t>& rgb) {
-    FILE* const f = std::fopen(path, "wb");
-    if (!f)
-        return;
-
-    std::fprintf(f, "P6\n%d %d\n255\n", STREAM_WIDTH, STREAM_HEIGHT);
-    std::fwrite(rgb.data(), 1, rgb.size(), f);
-    std::fclose(f);
-}
-
-void OnDepthFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp) {
+void TestOnDepthFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp) {
     static int frame_count = 0;
     frame_count++;
 
@@ -266,7 +328,7 @@ void OnDepthFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t ti
     }
 }
 
-void OnColorFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp) {
+void TestOnColorFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp) {
     static int frame_count = 0;
     frame_count++;
 
@@ -282,77 +344,7 @@ void OnColorFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t ti
     }
 }
 
-// Frame callbacks run on the URB reaping thread; anything slow there (pixel
-// conversion, disk writes) delays URB resubmission and the iso ring
-// under-runs. This hands completed frames to a dedicated thread instead.
-class FrameWorker {
-  public:
-    explicit FrameWorker(StreamParser::FrameCallback cb)
-        : cb_(std::move(cb)), thread_([this] { loop(); }) {}
-
-    // joins the processing thread; a detached thread would still be blocked
-    // on cv_ when the members get destroyed (UB, hangs in glibc)
-    ~FrameWorker() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-        }
-        cv_.notify_one();
-        thread_.join();
-    }
-
-    void push(const std::vector<std::uint8_t>& frame, const std::uint32_t ts) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.size() >= 4)  // backlogged; drop rather than stall
-            return;
-
-        queue_.emplace_back(frame, ts);
-        cv_.notify_one();
-    }
-
-  private:
-    void loop() {
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-            if (stop_)
-                return;
-
-            const auto [frame, ts] = std::move(queue_.front());
-            queue_.pop_front();
-            lock.unlock();
-
-            cb_(frame, ts);
-        }
-    }
-
-    StreamParser::FrameCallback cb_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::deque<std::pair<std::vector<std::uint8_t>, std::uint32_t>> queue_;
-    bool stop_ = false;
-    std::thread thread_;  // last member: starts after everything it touches
-};
-
-}  // namespace
-
-namespace {
-USBIO::BulkCaptureConfig MakeBulkConfig(
-    const USBIO::EndpointDescriptor& ep, std::shared_ptr<StreamParser> parser) {
-    USBIO::BulkCaptureConfig cfg;
-    cfg.ep = ep;
-    // parser is shared with the reading thread; it lives as long as the
-    // capture does (the driver never tears streams down)
-    cfg.on_data = [parser = std::move(parser)](const uint8_t* data, size_t len) {
-        parser->feed(data, len);
-    };
-
-    return cfg;
-}
-
-}  // namespace
-
-void Driver::startDepthStream()
+void Driver::startDepthStream(StreamParser::FrameCallback cb)
 {
     const InterfaceKey key{DATA_INTERFACE, BULK_ALT_SETTING};
     const auto& eps = receive_endpoints_[key].second;
@@ -361,7 +353,7 @@ void Driver::startDepthStream()
     if (ep_it == eps.end())
         throw std::runtime_error("No depth bulk endpoint");
 
-    auto worker = std::make_shared<FrameWorker>(OnDepthFrame);
+    auto worker = std::make_shared<FrameWorker>(cb);
     auto parser = std::make_shared<StreamParser>(
         StreamParser::DEPTH_START, StreamParser::DEPTH_END,
         [worker](const std::vector<std::uint8_t>& frame, const std::uint32_t ts) {
@@ -388,7 +380,7 @@ void Driver::startDepthStream()
     std::cout << "Depth stream started" << std::endl;
 }
 
-void Driver::startColorStream()
+void Driver::startColorStream(StreamParser::FrameCallback cb)
 {
     const InterfaceKey key{DATA_INTERFACE, BULK_ALT_SETTING};
     const auto& eps = receive_endpoints_[key].second;
@@ -397,7 +389,7 @@ void Driver::startColorStream()
     if (ep_it == eps.end())
         throw std::runtime_error("No image bulk endpoint");
 
-    auto worker = std::make_shared<FrameWorker>(OnColorFrame);
+    auto worker = std::make_shared<FrameWorker>(cb);
     auto parser = std::make_shared<StreamParser>(
         StreamParser::IMAGE_START, StreamParser::IMAGE_END,
         [worker](const std::vector<std::uint8_t>& frame, const std::uint32_t ts) {

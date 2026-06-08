@@ -17,7 +17,7 @@ int main() {
   g_driver = &d;
 
   // exit cleanly so the sensor streams get turned off; killing the process
-  // mid stream wedges the sensor until reboot
+  // mid stream bricks the sensor until reboot
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
 

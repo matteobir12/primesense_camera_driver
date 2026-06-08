@@ -3,6 +3,7 @@
 
 #include "usb_io/u_usbfs_io.h"
 #include "ps1080_host_protocol.h"
+#include "ps1080_stream_parser.h"
 
 #include <atomic>
 #include <memory>
@@ -13,6 +14,9 @@
 #define SENSOR_PROTOCOL_USB_BUFFER_SIZE 4 * 1024 * 1024
 
 namespace PS1080 {
+void TestOnDepthFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp);
+void TestOnColorFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp);
+
 class Driver {
   public:
     // Search for usb device
@@ -35,10 +39,11 @@ class Driver {
 
   private:
     void init();
-    // Per stream setup: iso capture + firmware params. Don't block;
+
+    // Per stream setup: iso capture + firmware params. Doesn't block
     // frames arrive on the iso reaping threads.
-    void startDepthStream();
-    void startColorStream();
+    void startDepthStream(StreamParser::FrameCallback cb = TestOnDepthFrame);
+    void startColorStream(StreamParser::FrameCallback cb = TestOnColorFrame);
     void initFirmware();
 
     struct InterfaceKey {
