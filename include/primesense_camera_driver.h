@@ -17,6 +17,10 @@ namespace PS1080 {
 void TestOnDepthFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp);
 void TestOnColorFrame(const std::vector<std::uint8_t>& frame, const std::uint32_t timestamp);
 
+inline constexpr std::uint16_t STREAM_WIDTH = 640;
+inline constexpr std::uint16_t STREAM_HEIGHT = 480;
+inline constexpr std::uint16_t STREAM_FPS = 30;
+
 class Driver {
   public:
     // Search for usb device
@@ -31,7 +35,8 @@ class Driver {
     void requestStop() { stop_requested_.store(true); }
 
     std::string fetchStringFromST(const int indx);
-    void StreamDepth();
+    void StreamDepth(StreamParser::FrameCallback cb);
+    void StreamRGB(StreamParser::FrameCallback cb);
 
     // Same, but with the color stream (VGA 30fps, uncompressed YUV422)
     // running alongside depth.

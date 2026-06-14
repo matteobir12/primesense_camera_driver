@@ -35,10 +35,6 @@ constexpr std::uint8_t BULK_ALT_SETTING = 0;
 constexpr std::uint8_t DEPTH_EP = 0x81;
 constexpr std::uint8_t IMAGE_EP = 0x82;
 
-constexpr std::uint16_t STREAM_WIDTH = 640;
-constexpr std::uint16_t STREAM_HEIGHT = 480;
-constexpr std::uint16_t STREAM_FPS = 30;
-
 std::vector<USBIO::InterfaceDescriptor> FetchConnectionInterfaces(const int fd) {
     const auto dt = USBIO::getUSBDescriptorTree(fd);
 
@@ -416,9 +412,17 @@ void Driver::startColorStream(StreamParser::FrameCallback cb)
     std::cout << "Color stream started" << std::endl;
 }
 
-void Driver::StreamDepth()
+void Driver::StreamDepth(StreamParser::FrameCallback cb)
 {
-    startDepthStream();
+    startDepthStream(std::move(cb));
+
+    while (!stop_requested_.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
+void Driver::StreamRGB(StreamParser::FrameCallback cb)
+{
+    startColorStream(std::move(cb));
 
     while (!stop_requested_.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
